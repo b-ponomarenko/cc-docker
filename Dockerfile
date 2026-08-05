@@ -60,7 +60,10 @@ RUN set -eux; \
 # is immutable (use `doclaude self rebuild` to move to a newer version).
 ENV CLAUDE_INSTALL_HOME=/opt/claude
 COPY scripts/install-claude.sh /opt/doclaude-install-claude.sh
-RUN set -eux; \
+# The cache mount keeps the part-downloaded binary across builds, so a build
+# that fails on a slow link does not throw away the 200 MB it already fetched.
+RUN --mount=type=cache,target=/var/cache/doclaude,sharing=locked \
+    set -eux; \
     chmod +x /opt/doclaude-install-claude.sh; \
     /opt/doclaude-install-claude.sh "$CLAUDE_VERSION"; \
     ln -sf "$CLAUDE_INSTALL_HOME/.local/bin/claude" /usr/local/bin/claude; \

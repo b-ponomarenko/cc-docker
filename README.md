@@ -266,9 +266,18 @@ a slow download from a dead one:
 cc-docker: downloaded 160 MiB of 272 MiB (58%)
 ```
 
-If those lines stop advancing the transfer is aborted after two minutes below
-2 KB/s and retried, resuming rather than starting over. Three failed attempts
-fall back to the official installer.
+If those lines stop advancing, the transfer is aborted after five minutes below
+1 KB/s and retried, resuming rather than starting over.
+
+A build that fails part-way does not throw away what it fetched: the partial
+download lives in a BuildKit cache mount, so re-running `./install.sh` picks up
+where it stopped. (`--no-cache` discards it — avoid that flag on a slow link.)
+
+If the download fails outright, the build stops instead of falling back to the
+official installer: that installer fetches the same file from the same place,
+twice, under its own ten-minute deadline, so it would only reach the same
+failure more slowly. `Download timed out: exceeded the total deadline` is what
+that looks like.
 
 **`/usage` says "Failed to load usage data" while everything else works.**
 Something has set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Claude Code tests
