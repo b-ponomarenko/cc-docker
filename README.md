@@ -218,6 +218,13 @@ taken on the host. `doclaude self agent log` says so explicitly. Retry `/login`;
 the port is random, so a second attempt almost always lands. Failing that, use
 the manual code-entry option Claude Code offers.
 
+**`/usage` says "Failed to load usage data" while everything else works.**
+Something has set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Claude Code tests
+that variable for *presence*, not value — even `=0` switches it on — and in that
+mode `/api/oauth/usage` is refused, along with `/design-sync` and ultrareview.
+`doclaude self doctor` reports it. Remove it from `env` in
+`~/.cc-docker/config.json` and from any `extraDockerArgs`.
+
 **An MCP server shows as failed.** `doclaude self agent log` records the exact
 command line and the server's stderr. The usual cause is a tool that your login
 shell only puts on `PATH` interactively — confirm with

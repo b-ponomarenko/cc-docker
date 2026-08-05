@@ -600,6 +600,41 @@ async function cmdDoctor(config) {
     ok('agent bind address', bindHost);
   }
 
+  // Some Claude Code switches are tested for *presence*, not value — even `=0`
+  // turns them on — and they disable features silently. Surface them rather
+  // than let a user wonder why /usage reports "Failed to load usage data".
+  const PRESENCE_FLAGS = {
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:
+      'essential-traffic-only mode: /usage, /design-sync and ultrareview stop working',
+    DISABLE_TELEMETRY: 'telemetry off',
+    DO_NOT_TRACK: 'telemetry off',
+  };
+  let imageEnv = [];
+  try {
+    imageEnv = JSON.parse(
+      execFileSync(docker, ['image', 'inspect', config.image, '--format', '{{json .Config.Env}}'], {
+        encoding: 'utf8',
+        timeout: 20000,
+      }),
+    );
+  } catch {
+    /* image missing; already reported above */
+  }
+  const effective = new Map();
+  for (const entry of imageEnv) {
+    const eq = entry.indexOf('=');
+    if (eq > 0) effective.set(entry.slice(0, eq), 'image');
+  }
+  for (const key of Object.keys(config.env || {})) effective.set(key, 'config.json');
+  const flagged = Object.keys(PRESENCE_FLAGS).filter((key) => effective.has(key));
+  if (flagged.length) {
+    for (const key of flagged) {
+      warn(`${key} is set (${effective.get(key)})`, PRESENCE_FLAGS[key]);
+    }
+  } else {
+    ok('no feature-disabling env flags');
+  }
+
   // The one check that cannot be reasoned about: whether a real container on
   // this particular runtime can actually open a socket back to the agent.
   if (imageExists(docker, config.image)) {

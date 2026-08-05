@@ -80,8 +80,12 @@ LABEL org.opencontainers.image.title="cc-docker" \
       org.opencontainers.image.description="Claude Code in Docker with live access to the local environment" \
       org.opencontainers.image.source="https://github.com/cc-docker/cc-docker"
 
+# Note: do NOT set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC here. Claude Code
+# tests that variable for *presence*, not value — even `=0` switches it into
+# essential-traffic-only mode, which silently refuses /api/oauth/usage and makes
+# /usage report "Failed to load usage data". Users who want that mode can add it
+# to `env` in ~/.cc-docker/config.json.
 ENV DISABLE_AUTOUPDATER=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0 \
     DOCLAUDE_IN_CONTAINER=1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/doclaude/entrypoint.sh"]
