@@ -152,6 +152,43 @@ For the same reason shells in the container are **not** login shells: your
 
 ---
 
+## Networks that inspect TLS
+
+Corporate proxies (Zscaler, Netskope, most enterprise firewalls) re-sign every
+HTTPS connection with a private root certificate. Your host trusts it; a stock
+Debian container has never seen it. The symptom is a build that dies on its
+first download:
+
+```
+curl: (60) SSL certificate problem: self-signed certificate in certificate chain
+```
+
+`install.sh` handles this on its own: it collects the extra roots your machine
+already trusts — the macOS System keychain, `/usr/local/share/ca-certificates`
+and `/etc/pki/ca-trust/source/anchors` on Linux, plus any of `NODE_EXTRA_CA_CERTS`,
+`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` set in your shell — and
+installs them into the image before the first outbound request. If detection
+comes up empty, point it at the root directly:
+
+```bash
+./install.sh --ca-file /path/to/corporate-root.crt     # repeatable
+```
+
+On macOS you can export everything your machine trusts with:
+
+```bash
+security find-certificate -a -p /Library/Keychains/System.keychain > roots.crt
+```
+
+Both paths are covered: the system trust store (curl, uv, apt, the build itself)
+and `NODE_EXTRA_CA_CERTS` (node, npx, Claude Code). `NODE_EXTRA_CA_CERTS` is
+*additive* — cc-docker deliberately never sets `SSL_CERT_FILE`, which would
+**replace** the public roots and break everything the corporate CA did not sign.
+
+A root added later takes effect on the next run without a rebuild: the
+entrypoint refreshes the trust store when the bundle changes. `doclaude self
+doctor` verifies a real TLS handshake from inside a real container.
+
 ## Configuration
 
 Everything lives in `~/.cc-docker/config.json` (`doclaude self config edit`).
@@ -172,6 +209,7 @@ Re-running `install.sh` merges new defaults without discarding your edits.
 | `forwardEnv` | API keys, proxies, `GH_TOKEN` | environment inherited from your shell |
 | `forwardPorts` | `[]` | container ports pre-tunnelled to the host (dev servers) |
 | `sshAgentMode` | `auto` | `auto`, `docker-desktop`, `direct`, `off` |
+| `caBundle` | `~/.cc-docker/certs/extra-ca.crt` | extra roots for TLS-inspecting networks |
 | `containerSudo` | `true` | passwordless sudo inside the container |
 | `agentBind` | loopback / docker bridge | where the host agent listens |
 
@@ -289,6 +327,7 @@ Not yet exercised: a Linux host, and Podman/colima specifically.
 
 ```bash
 npm test                   # host agent, wire protocol, config generation
+./test/tls-integration.sh  # extra root certificates (needs Docker + openssl)
 ./install.sh --no-build    # refresh config and the doclaude command only
 DOCLAUDE_DEBUG=1 doclaude  # print the full docker run command line
 ```

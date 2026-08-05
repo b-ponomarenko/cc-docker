@@ -33,6 +33,22 @@ RUN set -eux; \
     ln -sf /usr/bin/fdfind /usr/local/bin/fd; \
     rm -rf /var/lib/apt/lists/*
 
+# Extra root certificates, installed before the first outbound HTTPS request.
+#
+# On a network that inspects TLS every connection is re-signed with a private
+# root. The host trusts it; this container would not, and the very next `curl`
+# would fail with "self-signed certificate in certificate chain". install.sh
+# collects those roots from the host into certs/ automatically.
+COPY certs/ /usr/local/share/ca-certificates/doclaude/
+RUN set -eux; \
+    found="$(find /usr/local/share/ca-certificates/doclaude -maxdepth 1 -name '*.crt' | wc -l)"; \
+    if [ "$found" -gt 0 ]; then \
+      update-ca-certificates; \
+      echo "cc-docker: trusting $found extra CA file(s) from the host"; \
+    else \
+      echo "cc-docker: no extra CA certificates supplied"; \
+    fi
+
 # uv / uvx — a large share of stdio MCP servers are distributed as `uvx <pkg>`.
 RUN set -eux; \
     curl -LsSf https://astral.sh/uv/install.sh \

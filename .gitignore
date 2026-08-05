@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 .serena/
+certs/*.crt
+certs/*.pem
+certs/*.cer

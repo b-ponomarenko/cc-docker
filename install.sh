@@ -21,6 +21,7 @@ IMAGE=""
 CLAUDE_VERSION=""
 MOUNT_PROFILE=""
 APT_PACKAGES=""
+CA_FILES=()
 
 usage() {
   cat <<'EOF'
@@ -32,6 +33,8 @@ Usage: ./install.sh [options]
   --claude-version VER    pin Claude Code            (default latest)
   --profile home|project  filesystem exposure        (default home)
   --apt "pkg1 pkg2"       extra apt packages in the image
+  --ca-file PATH          extra root certificate to trust (repeatable);
+                          needed on networks that intercept TLS
   --bin-dir DIR           where to install `doclaude`
   --reinstall             refresh files and rebuild (used by `doclaude self update`)
   -h, --help              this message
@@ -47,6 +50,7 @@ while [ $# -gt 0 ]; do
     --claude-version) CLAUDE_VERSION="$2"; shift ;;
     --profile) MOUNT_PROFILE="$2"; shift ;;
     --apt) APT_PACKAGES="$2"; shift ;;
+    --ca-file) CA_FILES+=("$2"); shift ;;
     --bin-dir) BIN_DIR="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -129,6 +133,28 @@ else
   ok "reusing existing agent token"
 fi
 
+# Extra root certificates. On a network that inspects TLS, every HTTPS call from
+# the build and from the running container is re-signed with a private root that
+# a stock Debian image has never heard of.
+CA_ARGS=()
+for f in ${CA_FILES+"${CA_FILES[@]}"}; do
+  [ -f "$f" ] || die "no such certificate file: $f"
+  CA_ARGS+=(--ca-file "$f")
+done
+
+mkdir -p "$CCD_DIR/certs" "$REPO_DIR/certs"
+CA_BUNDLE="$CCD_DIR/certs/extra-ca.crt"
+CA_REPORT="$(node "$REPO_DIR/lib/collect-ca.mjs" --out "$CA_BUNDLE" ${CA_ARGS+"${CA_ARGS[@]}"})"
+CA_COUNT="$(printf '%s' "$CA_REPORT" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log(JSON.parse(s).count))')"
+
+rm -f "$REPO_DIR"/certs/*.crt
+if [ "$CA_COUNT" -gt 0 ]; then
+  cp "$CA_BUNDLE" "$REPO_DIR/certs/extra-ca.crt"
+  ok "trusting $CA_COUNT extra root certificate(s) from this host"
+else
+  ok "no extra root certificates on this host (standard public trust store)"
+fi
+
 # The agent runs from ~/.cc-docker so that deleting the checkout does not break
 # an installed doclaude.
 rm -rf "$CCD_DIR/lib/host" "$CCD_DIR/lib/shared"
@@ -169,7 +195,27 @@ if [ "$DO_BUILD" = "1" ]; then
   [ -n "$CLAUDE_VERSION" ] && BUILD_ARGS+=(--build-arg "CLAUDE_VERSION=$CLAUDE_VERSION")
   [ -n "$APT_PACKAGES" ] && BUILD_ARGS+=(--build-arg "EXTRA_APT_PACKAGES=$APT_PACKAGES")
   BUILD_ARGS+=("$REPO_DIR")
-  "$DOCKER_BIN" "${BUILD_ARGS[@]}"
+  if ! "$DOCKER_BIN" "${BUILD_ARGS[@]}"; then
+    printf '\n  %s✗%s Image build failed.\n' "$RED" "$RESET" >&2
+    cat >&2 <<EOF
+
+  If the log above mentions ${BOLD}self-signed certificate in certificate chain${RESET} or
+  another TLS verification error, this network inspects TLS and the container
+  does not yet trust its root certificate.
+
+  Export that root and point the installer at it:
+
+      ./install.sh --ca-file /path/to/corporate-root.crt
+
+  macOS   Keychain Access → System → your organisation's root → Export as .cer,
+          or ask IT for the bundle. \`security find-certificate -a -p \\
+          /Library/Keychains/System.keychain > roots.crt\` exports them all.
+  Linux   usually already in /usr/local/share/ca-certificates or
+          /etc/pki/ca-trust/source/anchors — those are picked up automatically.
+
+EOF
+    exit 1
+  fi
   ok "image built"
 else
   step "Skipping image build (--no-build)"

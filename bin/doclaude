@@ -335,6 +335,15 @@ function buildEnv(config, { session, agent, workdir }) {
     env.DOCLAUDE_FORWARD_PORTS = config.forwardPorts.join(',');
   }
 
+  // Extra root certificates for TLS-inspecting networks. NODE_EXTRA_CA_CERTS is
+  // additive — unlike SSL_CERT_FILE, which would *replace* the default roots
+  // and break everything the corporate CA did not sign.
+  const caBundle = config.caBundle || path.join(CCD_DIR, 'certs', 'extra-ca.crt');
+  if (fs.existsSync(caBundle)) {
+    env.DOCLAUDE_CA_BUNDLE = caBundle;
+    env.NODE_EXTRA_CA_CERTS = caBundle;
+  }
+
   // Setup notes are useful when you are watching a session start, and pure
   // noise when the output is being piped or read by a script.
   const scripted = !process.stdout.isTTY || process.argv.includes('-p') || process.argv.includes('--print');
@@ -535,6 +544,19 @@ function cmdRebuild(config, argv) {
   if (!config.repoDir || !fs.existsSync(path.join(config.repoDir, 'Dockerfile'))) {
     die(`cannot find the cc-docker checkout at ${config.repoDir}`, 'Re-run ./install.sh from the repository.');
   }
+  // Keep the build context's certificates in step with the live bundle, so a
+  // root added after installation is picked up by a plain rebuild.
+  const caBundle = config.caBundle || path.join(CCD_DIR, 'certs', 'extra-ca.crt');
+  const contextCerts = path.join(config.repoDir, 'certs');
+  try {
+    fs.mkdirSync(contextCerts, { recursive: true });
+    const target = path.join(contextCerts, 'extra-ca.crt');
+    if (fs.existsSync(caBundle)) fs.copyFileSync(caBundle, target);
+    else if (fs.existsSync(target)) fs.unlinkSync(target);
+  } catch (err) {
+    console.error(yellow(`could not sync CA certificates into the build context: ${err.message}`));
+  }
+
   const args = ['build', '-t', config.image];
   if (argv.includes('--no-cache')) args.push('--no-cache');
   if (config.claudeVersion) args.push('--build-arg', `CLAUDE_VERSION=${config.claudeVersion}`);
@@ -635,6 +657,12 @@ async function cmdDoctor(config) {
     ok('no feature-disabling env flags');
   }
 
+  const caBundle = config.caBundle || path.join(CCD_DIR, 'certs', 'extra-ca.crt');
+  if (fs.existsSync(caBundle)) {
+    const count = (fs.readFileSync(caBundle, 'utf8').match(/BEGIN CERTIFICATE/g) || []).length;
+    ok('extra root certificates', `${count} trusted from the host`);
+  }
+
   // The one check that cannot be reasoned about: whether a real container on
   // this particular runtime can actually open a socket back to the agent.
   if (imageExists(docker, config.image)) {
@@ -647,6 +675,9 @@ async function cmdDoctor(config) {
         '-e', `DOCLAUDE_AGENT_PORT=${live.port}`,
         '-e', 'DOCLAUDE_TOKEN_FILE=/tmp/doclaude-token',
         '-v', `${TOKEN_FILE}:/tmp/doclaude-token:ro`,
+        ...(fs.existsSync(caBundle)
+          ? ['-v', `${caBundle}:/tmp/doclaude-ca.crt:ro`, '-e', 'NODE_EXTRA_CA_CERTS=/tmp/doclaude-ca.crt']
+          : []),
         '--entrypoint', 'node',
         config.image,
         '/opt/doclaude/bin/ccd-probe.mjs',
@@ -665,6 +696,19 @@ async function cmdDoctor(config) {
       bad('container → host agent', report.error || 'handshake refused');
     } else {
       bad('container → host agent', (probe.stderr || 'could not run the probe container').trim().split('\n')[0]);
+    }
+
+    if (report && report.tls) {
+      if (report.tls.ok) {
+        ok('container TLS to api.anthropic.com', `handshake fine (HTTP ${report.tls.status})`);
+      } else if (/SELF_SIGNED|UNABLE_TO_(GET|VERIFY)|CERT_|certificate/i.test(report.tls.error || '')) {
+        bad(
+          'container TLS to api.anthropic.com',
+          `${report.tls.error} — this network inspects TLS; re-run install.sh --ca-file <root.crt>`,
+        );
+      } else {
+        warn('container TLS to api.anthropic.com', report.tls.error);
+      }
     }
   }
 

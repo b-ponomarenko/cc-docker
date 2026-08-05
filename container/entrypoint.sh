@@ -68,6 +68,26 @@ if [ -n "${DOCLAUDE_SHIM_COMMANDS:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# extra root certificates
+#
+# The image already trusts whatever was in certs/ at build time. Re-checking at
+# startup means a CA added afterwards takes effect without a rebuild — and costs
+# nothing when the bundle has not changed.
+# ---------------------------------------------------------------------------
+
+if [ -n "${DOCLAUDE_CA_BUNDLE:-}" ] && [ -f "$DOCLAUDE_CA_BUNDLE" ]; then
+  ca_target=/usr/local/share/ca-certificates/doclaude/host-runtime.crt
+  if ! cmp -s "$DOCLAUDE_CA_BUNDLE" "$ca_target" 2>/dev/null; then
+    mkdir -p "$(dirname "$ca_target")"
+    if cp "$DOCLAUDE_CA_BUNDLE" "$ca_target" && update-ca-certificates >/dev/null 2>&1; then
+      log "refreshed the trust store from $DOCLAUDE_CA_BUNDLE"
+    else
+      log "could not refresh the trust store from $DOCLAUDE_CA_BUNDLE"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # container-private caches
 #
 # The host home is mounted read-write, so an unguarded npm/uv/pip cache would be
