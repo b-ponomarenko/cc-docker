@@ -158,6 +158,42 @@ test('seeds settings.json once and then leaves the container copy alone', (t) =>
   );
 });
 
+test('switching settingsMode to link takes effect over an existing copy', (t) => {
+  const env = scaffold();
+  t.after(() => fs.rmSync(env.root, { recursive: true, force: true }));
+
+  assert.equal(env.run().status, 0);
+  const settings = path.join(env.configDir, 'settings.json');
+  assert.ok(!fs.lstatSync(settings).isSymbolicLink(), 'copy mode writes a real file');
+
+  // The user asked for linking; silently keeping the copy would ignore them.
+  fs.writeFileSync(path.join(env.ccdDir, 'config.json'), JSON.stringify({ settingsMode: 'link' }));
+  assert.equal(env.run().status, 0);
+  assert.ok(fs.lstatSync(settings).isSymbolicLink(), 'link mode must replace the copy');
+  assert.equal(fs.readlinkSync(settings), path.join(env.hostClaudeDir, 'settings.json'));
+  assert.ok(fs.existsSync(settings + '.bak'), 'the previous file must be kept, not discarded');
+});
+
+test('switching settingsMode back to copy detaches from the host file', (t) => {
+  const env = scaffold({ ccdConfig: { settingsMode: 'link' } });
+  t.after(() => fs.rmSync(env.root, { recursive: true, force: true }));
+
+  assert.equal(env.run().status, 0);
+  const settings = path.join(env.configDir, 'settings.json');
+  assert.ok(fs.lstatSync(settings).isSymbolicLink());
+
+  fs.writeFileSync(path.join(env.ccdDir, 'config.json'), JSON.stringify({ settingsMode: 'copy' }));
+  assert.equal(env.run().status, 0);
+  assert.ok(!fs.lstatSync(settings).isSymbolicLink(), 'copy mode must stop editing the host file');
+
+  // Editing the container copy must no longer touch the host's settings.
+  fs.writeFileSync(settings, JSON.stringify({ model: 'container-only' }));
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(env.hostClaudeDir, 'settings.json'), 'utf8')).model,
+    'opus',
+  );
+});
+
 test('preserves container session state across runs', (t) => {
   const env = scaffold({
     hostClaudeJson: {

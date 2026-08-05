@@ -35,6 +35,26 @@ Everything else — credentials, transcripts, `.claude.json` — stays
 container-side in `~/.cc-docker/claude`, so a Linux container never fights your
 host installation, and **you log in once**.
 
+### Where the container's settings live
+
+Nothing is baked into the image. The container's Claude Code configuration is a
+directory on your host, bind-mounted at run time:
+
+```
+~/.cc-docker/claude/settings.json     ← edit this; takes effect on the next run
+~/.cc-docker/claude/.claude.json      ← MCP config, project state (generated)
+~/.cc-docker/claude/.credentials.json ← your login
+~/.cc-docker/claude/skills → ~/.claude/skills        (symlink, always live)
+~/.cc-docker/claude/plugins → ~/.claude/plugins      (symlink, always live)
+```
+
+`settings.json` is **seeded once** from `~/.claude/settings.json` and then left
+alone, so container-side edits survive and the host's file is never modified.
+That is the `settingsMode: "copy"` default. To have the container follow your
+host settings instead, set `"settingsMode": "link"` in `~/.cc-docker/config.json`
+— the copy is replaced with a symlink and kept as `settings.json.bak`. Switching
+back to `"copy"` detaches again. No rebuild is needed either way.
+
 ---
 
 ## How it fits together

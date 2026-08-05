@@ -73,7 +73,14 @@ fs.mkdirSync(CONFIG_DIR, { recursive: true });
 // 1. live linkage to the host's ~/.claude
 // ---------------------------------------------------------------------------
 
-function link(name) {
+/**
+ * Point CONFIG_DIR/<name> at the host's copy.
+ *
+ * `replaceRegular` exists for settings.json: leaving a real file alone is the
+ * right default for the automatically linked directories, but when the user has
+ * explicitly asked for `settingsMode: "link"` it would silently ignore them.
+ */
+function link(name, { replaceRegular = false } = {}) {
   const source = path.join(HOST_CLAUDE_DIR, name);
   const target = path.join(CONFIG_DIR, name);
   if (!fs.existsSync(source)) return false;
@@ -88,6 +95,11 @@ function link(name) {
     if (current.isSymbolicLink()) {
       if (fs.readlinkSync(target) === source) return true;
       fs.unlinkSync(target);
+    } else if (replaceRegular) {
+      // Keep whatever was there: it may hold container-side edits.
+      const backup = `${target}.bak`;
+      fs.renameSync(target, backup);
+      note(`replaced ${name} with a link to the host; the previous file is ${path.basename(backup)}`);
     } else {
       note(`${name} exists in the container config and is not a link — leaving it alone`);
       return false;
@@ -114,11 +126,28 @@ if (linked.length) note(`linked from host: ${linked.join(', ')}`);
 
 const hostSettings = path.join(HOST_CLAUDE_DIR, 'settings.json');
 const containerSettings = path.join(CONFIG_DIR, 'settings.json');
+
+function isSymlink(file) {
+  try {
+    return fs.lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 if (settingsMode === 'link') {
-  link('settings.json');
-} else if (settingsMode === 'copy' && fs.existsSync(hostSettings) && !fs.existsSync(containerSettings)) {
-  fs.copyFileSync(hostSettings, containerSettings);
-  note('seeded settings.json from the host (edit it in ~/.cc-docker/claude/settings.json)');
+  link('settings.json', { replaceRegular: true });
+} else if (settingsMode === 'copy' && fs.existsSync(hostSettings)) {
+  // A leftover symlink from a previous `link` run has to go, or switching back
+  // to `copy` would quietly keep editing the host's file.
+  if (isSymlink(containerSettings)) {
+    fs.unlinkSync(containerSettings);
+    fs.copyFileSync(hostSettings, containerSettings);
+    note(`settings.json is now a container-local copy at ${containerSettings}`);
+  } else if (!fs.existsSync(containerSettings)) {
+    fs.copyFileSync(hostSettings, containerSettings);
+    note(`seeded settings.json from the host — edit it at ${containerSettings}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
