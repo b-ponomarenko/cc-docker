@@ -256,6 +256,20 @@ taken on the host. `doclaude self agent log` says so explicitly. Retry `/login`;
 the port is random, so a second attempt almost always lands. Failing that, use
 the manual code-entry option Claude Code offers.
 
+**The build looks stuck on "Installing Claude Code".** Claude Code's native
+binary is ~290 MB, and on a link that inspects TLS every byte is decrypted,
+scanned and re-encrypted. cc-docker downloads it once (the official installer
+fetches it twice) and prints a progress line every 15 seconds, so you can tell
+a slow download from a dead one:
+
+```
+cc-docker: downloaded 160 MiB of 272 MiB (58%)
+```
+
+If those lines stop advancing the transfer is aborted after two minutes below
+2 KB/s and retried, resuming rather than starting over. Three failed attempts
+fall back to the official installer.
+
 **`/usage` says "Failed to load usage data" while everything else works.**
 Something has set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Claude Code tests
 that variable for *presence*, not value — even `=0` switches it on — and in that

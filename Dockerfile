@@ -59,13 +59,10 @@ RUN set -eux; \
 # shared by every runtime user; the auto-updater is disabled because the image
 # is immutable (use `doclaude self rebuild` to move to a newer version).
 ENV CLAUDE_INSTALL_HOME=/opt/claude
+COPY scripts/install-claude.sh /opt/doclaude-install-claude.sh
 RUN set -eux; \
-    mkdir -p "$CLAUDE_INSTALL_HOME"; \
-    if [ "$CLAUDE_VERSION" = "latest" ]; then \
-      curl -fsSL https://claude.ai/install.sh | env HOME="$CLAUDE_INSTALL_HOME" bash; \
-    else \
-      curl -fsSL https://claude.ai/install.sh | env HOME="$CLAUDE_INSTALL_HOME" bash -s -- "$CLAUDE_VERSION"; \
-    fi; \
+    chmod +x /opt/doclaude-install-claude.sh; \
+    /opt/doclaude-install-claude.sh "$CLAUDE_VERSION"; \
     ln -sf "$CLAUDE_INSTALL_HOME/.local/bin/claude" /usr/local/bin/claude; \
     chmod -R a+rX "$CLAUDE_INSTALL_HOME"; \
     /usr/local/bin/claude --version
