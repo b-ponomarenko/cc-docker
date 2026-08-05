@@ -1,0 +1,17 @@
+{
+  "name": "cc-docker",
+  "version": "0.1.0",
+  "description": "Run Claude Code in a Docker container with live access to the local environment",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "doclaude": "bin/doclaude"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,756 @@
+#!/usr/bin/env node
+/* eslint-disable no-console */
+//
+// doclaude — run Claude Code in a container that is wired to this machine.
+//
+// Deliberately CommonJS and dependency-free: this file is copied to
+// ~/.local/bin/doclaude, where an extensionless ESM file would not load.
+
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const net = require('net');
+const path = require('path');
+const crypto = require('crypto');
+const { spawn, spawnSync, execFileSync } = require('child_process');
+
+const CCD_DIR = process.env.DOCLAUDE_DIR || path.join(os.homedir(), '.cc-docker');
+const CONFIG_FILE = path.join(CCD_DIR, 'config.json');
+const RUN_FILE = path.join(CCD_DIR, 'run', 'agent.json');
+const TOKEN_FILE = path.join(CCD_DIR, 'agent.token');
+const LOG_FILE = path.join(CCD_DIR, 'logs', 'agent.log');
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+
+const isTTY = process.stdout.isTTY && process.stderr.isTTY;
+const colour = (code, s) => (isTTY ? `\x1b[${code}m${s}\x1b[0m` : s);
+const bold = (s) => colour('1', s);
+const dim = (s) => colour('2', s);
+const red = (s) => colour('31', s);
+const green = (s) => colour('32', s);
+const yellow = (s) => colour('33', s);
+
+function die(msg, hint) {
+  console.error(`${red('doclaude:')} ${msg}`);
+  if (hint) console.error(dim(hint));
+  process.exit(1);
+}
+
+function readJson(file, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function loadConfig() {
+  const cfg = readJson(CONFIG_FILE);
+  if (!cfg) {
+    die(
+      `no configuration at ${CONFIG_FILE}`,
+      'Run ./install.sh from the cc-docker checkout first.',
+    );
+  }
+  return cfg;
+}
+
+function which(cmd) {
+  const result = spawnSync(process.platform === 'win32' ? 'where' : 'which', [cmd], {
+    encoding: 'utf8',
+  });
+  return result.status === 0 ? result.stdout.trim().split('\n')[0] : null;
+}
+
+// ---------------------------------------------------------------------------
+// container runtime
+// ---------------------------------------------------------------------------
+
+function dockerCmd(config) {
+  const candidate = config.dockerCommand || process.env.DOCLAUDE_DOCKER || 'docker';
+  if (which(candidate)) return candidate;
+  for (const alt of ['docker', 'podman', 'nerdctl']) {
+    if (which(alt)) return alt;
+  }
+  die(
+    'no container runtime found on PATH',
+    'Install Docker Desktop, OrbStack, colima or podman, then re-run.',
+  );
+}
+
+function ensureDockerRunning(docker) {
+  const probe = spawnSync(docker, ['info', '--format', '{{.ServerVersion}}'], {
+    encoding: 'utf8',
+    timeout: 30000,
+  });
+  if (probe.status !== 0) {
+    die(
+      `${docker} is installed but the daemon is not reachable`,
+      (probe.stderr || '').trim() || 'Start Docker Desktop / colima and try again.',
+    );
+  }
+  return probe.stdout.trim();
+}
+
+function imageExists(docker, image) {
+  return spawnSync(docker, ['image', 'inspect', image], { stdio: 'ignore' }).status === 0;
+}
+
+// ---------------------------------------------------------------------------
+// host agent lifecycle
+// ---------------------------------------------------------------------------
+
+function pingAgent({ host, port }, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const token = (() => {
+      try {
+        return fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+      } catch {
+        return '';
+      }
+    })();
+    const socket = net.createConnection({ host: host === '0.0.0.0' ? '127.0.0.1' : host, port });
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(timeoutMs, () => finish(null));
+    socket.on('error', () => finish(null));
+    socket.on('connect', () => socket.write(JSON.stringify({ token, op: 'ping' }) + '\n'));
+    socket.on('data', (chunk) => {
+      try {
+        finish(JSON.parse(chunk.toString('utf8').split('\n')[0]));
+      } catch {
+        finish(null);
+      }
+    });
+  });
+}
+
+function readAgentRunFile() {
+  return readJson(RUN_FILE);
+}
+
+async function agentStatus() {
+  const run = readAgentRunFile();
+  if (!run) return { running: false };
+  const pong = await pingAgent(run);
+  if (pong && pong.ok) return { running: true, ...run, pid: pong.pid || run.pid };
+  return { running: false, stale: true, ...run };
+}
+
+async function startAgent(config) {
+  const existing = await agentStatus();
+  if (existing.running) return existing;
+
+  const agentScript = path.join(config.libDir, 'host', 'agent.mjs');
+  if (!fs.existsSync(agentScript)) {
+    die(`host agent is missing at ${agentScript}`, 'Re-run ./install.sh from the checkout.');
+  }
+  const node = config.nodeBin && fs.existsSync(config.nodeBin) ? config.nodeBin : which('node');
+  if (!node) die('Node.js is required on the host to run the cc-docker agent');
+
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+  const out = fs.openSync(LOG_FILE, 'a');
+  const child = spawn(node, [agentScript], {
+    detached: true,
+    stdio: ['ignore', out, out],
+    env: {
+      ...process.env,
+      DOCLAUDE_DIR: CCD_DIR,
+      DOCLAUDE_AGENT_BIND: config.agentBind || '127.0.0.1',
+      DOCLAUDE_AGENT_PORT: String(config.agentPort || 0),
+    },
+  });
+  child.unref();
+
+  for (let i = 0; i < 60; i += 1) {
+    await new Promise((r) => setTimeout(r, 100));
+    const status = await agentStatus();
+    if (status.running) return status;
+  }
+  die('the host agent did not come up', `Check ${LOG_FILE}`);
+}
+
+async function stopAgent() {
+  const run = readAgentRunFile();
+  if (!run) return false;
+  try {
+    process.kill(run.pid, 'SIGTERM');
+  } catch {
+    /* already gone */
+  }
+  try {
+    fs.unlinkSync(RUN_FILE);
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// docker run assembly
+// ---------------------------------------------------------------------------
+
+function resolveBindHost(config, docker) {
+  if (config.agentBind) return config.agentBind;
+  if (process.platform !== 'linux') return '127.0.0.1';
+  // On Linux the container reaches the host over the bridge gateway, so a
+  // loopback-only agent would be invisible.
+  try {
+    const raw = execFileSync(
+      docker,
+      ['network', 'inspect', 'bridge', '--format', '{{range .IPAM.Config}}{{.Gateway}}{{end}}'],
+      { encoding: 'utf8', timeout: 10000 },
+    ).trim();
+    if (raw) return raw;
+  } catch {
+    /* fall through */
+  }
+  return '172.17.0.1';
+}
+
+/** True when `entry` already comes along for the ride inside another mount. */
+function isRedundant(entry, others) {
+  return others.some((other) => {
+    if (other === entry) return false;
+    const prefix = other.target.endsWith(path.sep) ? other.target : other.target + path.sep;
+    if (!entry.target.startsWith(prefix)) return false;
+    const implied = path.join(other.source, entry.target.slice(other.target.length));
+    return implied === entry.source && other.mode !== 'ro';
+  });
+}
+
+function uniqueMounts(entries) {
+  const seen = new Set();
+  const deduped = [];
+  for (const entry of entries) {
+    if (!entry || !entry.source || !entry.target) continue;
+    if (seen.has(entry.target)) continue;
+    seen.add(entry.target);
+    deduped.push(entry);
+  }
+  const kept = deduped.filter((entry) => !isRedundant(entry, deduped));
+  // Docker applies nested mounts by destination depth; being explicit about the
+  // order keeps behaviour identical across runtimes.
+  return kept.sort((a, b) => a.target.split(path.sep).length - b.target.split(path.sep).length);
+}
+
+function buildMounts(config, workdir) {
+  const home = config.hostHome;
+  const entries = [];
+
+  if (config.mountProfile === 'home') {
+    entries.push({ source: home, target: home, mode: 'rw' });
+    // Normally inside $HOME and dropped as redundant, but DOCLAUDE_DIR can be
+    // moved anywhere — and without it the container cannot read the agent token.
+    entries.push({ source: CCD_DIR, target: CCD_DIR, mode: 'rw' });
+    entries.push({ source: config.claudeConfigDir, target: config.claudeConfigDir, mode: 'rw' });
+    entries.push({ source: config.hostClaudeDir, target: config.hostClaudeDir, mode: 'rw' });
+  } else {
+    entries.push({ source: workdir, target: workdir, mode: 'rw' });
+    entries.push({ source: config.hostClaudeDir, target: config.hostClaudeDir, mode: 'rw' });
+    const hostClaudeJson = config.hostClaudeJson;
+    if (fs.existsSync(hostClaudeJson)) {
+      entries.push({ source: hostClaudeJson, target: hostClaudeJson, mode: 'ro' });
+    }
+    entries.push({ source: CCD_DIR, target: CCD_DIR, mode: 'rw' });
+    entries.push({ source: config.claudeConfigDir, target: config.claudeConfigDir, mode: 'rw' });
+    // Skills and plugins routinely symlink out to sibling directories.
+    for (const extra of ['.agents', '.config/claude']) {
+      const p = path.join(home, extra);
+      if (fs.existsSync(p)) entries.push({ source: p, target: p, mode: 'rw' });
+    }
+  }
+
+  // Working directory outside the mounted tree (common with /opt or /srv repos).
+  if (!workdir.startsWith(entries[0].target + path.sep) && workdir !== entries[0].target) {
+    entries.push({ source: workdir, target: workdir, mode: 'rw' });
+  }
+
+  for (const extra of config.extraMounts || []) {
+    if (typeof extra === 'string') {
+      const [source, target, mode] = extra.split(':');
+      entries.push({ source, target: target || source, mode: mode || 'rw' });
+    } else {
+      entries.push({ source: extra.source, target: extra.target || extra.source, mode: extra.mode || 'rw' });
+    }
+  }
+
+  return uniqueMounts(entries).filter((e) => fs.existsSync(e.source));
+}
+
+/**
+ * SSH agent forwarding. Docker Desktop exposes the host agent at a fixed magic
+ * path inside the VM; on Linux the real socket can be bind-mounted directly.
+ * Returns the docker flags plus the SSH_AUTH_SOCK the container should see.
+ */
+function sshAgentArgs(config) {
+  const mode = config.sshAgentMode || 'auto';
+  if (mode === 'off') return { args: [], env: {} };
+
+  const hostSock = process.env.SSH_AUTH_SOCK;
+  if (!hostSock) return { args: [], env: {} };
+
+  const resolved = mode === 'auto' ? (process.platform === 'linux' ? 'direct' : 'docker-desktop') : mode;
+
+  if (resolved === 'docker-desktop') {
+    const magic = '/run/host-services/ssh-auth.sock';
+    return { args: ['-v', `${magic}:${magic}`], env: { SSH_AUTH_SOCK: magic } };
+  }
+  if (!fs.existsSync(hostSock)) return { args: [], env: {} };
+  return { args: ['-v', `${hostSock}:${hostSock}`], env: { SSH_AUTH_SOCK: hostSock } };
+}
+
+function buildEnv(config, { session, agent, workdir }) {
+  const env = {
+    HOME: config.hostHome,
+    USER: config.hostUser,
+    LOGNAME: config.hostUser,
+    DOCLAUDE_UID: String(config.hostUid),
+    DOCLAUDE_GID: String(config.hostGid),
+    DOCLAUDE_DIR: CCD_DIR,
+    DOCLAUDE_SESSION: session,
+    DOCLAUDE_WORKDIR: workdir,
+    DOCLAUDE_AGENT_HOST: 'host.docker.internal',
+    DOCLAUDE_AGENT_PORT: String(agent.port),
+    DOCLAUDE_TOKEN_FILE: TOKEN_FILE,
+    DOCLAUDE_HOST_CLAUDE_DIR: config.hostClaudeDir,
+    DOCLAUDE_HOST_CLAUDE_JSON: config.hostClaudeJson,
+    DOCLAUDE_HOST_PLATFORM: process.platform,
+    DOCLAUDE_SHIM_COMMANDS: (config.shimCommands || []).join(','),
+    DOCLAUDE_FORWARD_ENV: (config.forwardEnv || []).join(','),
+    DOCLAUDE_SUDO: config.containerSudo === false ? '0' : '1',
+    CLAUDE_CONFIG_DIR: config.claudeConfigDir,
+  };
+
+  if (config.forwardPorts && config.forwardPorts.length) {
+    env.DOCLAUDE_FORWARD_PORTS = config.forwardPorts.join(',');
+  }
+
+  // Pass through terminal/locale so the TUI renders the same as on the host.
+  for (const key of ['TERM', 'COLORTERM', 'LANG', 'LC_ALL', 'TERM_PROGRAM']) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  // Plus whatever the user asked to inherit (tokens, proxies, ...).
+  for (const key of config.forwardEnv || []) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  for (const [key, value] of Object.entries(config.env || {})) env[key] = value;
+
+  return env;
+}
+
+function dockerRunArgs(config, { session, agent, workdir, shell, extraDockerArgs = [] }) {
+  const args = ['run', '--rm', '-i'];
+  if (process.stdin.isTTY && process.stdout.isTTY) args.push('-t');
+
+  args.push('--name', `doclaude-${session}`);
+  args.push('--hostname', config.containerHostname || 'doclaude');
+  args.push('--add-host', 'host.docker.internal:host-gateway');
+  args.push('-w', workdir);
+
+  for (const mount of buildMounts(config, workdir)) {
+    args.push('-v', `${mount.source}:${mount.target}${mount.mode === 'ro' ? ':ro' : ''}`);
+  }
+
+  const ssh = sshAgentArgs(config);
+  args.push(...ssh.args);
+
+  const env = { ...buildEnv(config, { session, agent, workdir }), ...ssh.env };
+  if (shell) env.DOCLAUDE_SHELL = '1';
+  for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
+
+  for (const flag of config.extraDockerArgs || []) args.push(flag);
+  for (const flag of extraDockerArgs) args.push(flag);
+
+  args.push(config.image);
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// `doclaude self ...`
+// ---------------------------------------------------------------------------
+
+function credentialsPath(config) {
+  return path.join(config.claudeConfigDir, '.credentials.json');
+}
+
+function readHostCredentials(config) {
+  if (process.platform === 'darwin') {
+    const result = spawnSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'], {
+      encoding: 'utf8',
+    });
+    if (result.status === 0 && result.stdout.trim()) return result.stdout.trim();
+    return null;
+  }
+  const file = path.join(config.hostClaudeDir, '.credentials.json');
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function describeCredentials(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    const oauth = parsed.claudeAiOauth || parsed.claudeAiOAuth;
+    if (!oauth) return 'present (no subscription token)';
+    const expires = oauth.expiresAt ? new Date(oauth.expiresAt) : null;
+    const tier = oauth.subscriptionType || 'unknown';
+    if (!expires) return `subscription: ${tier}`;
+    const fresh = expires.getTime() > Date.now();
+    return `subscription: ${tier}, access token ${fresh ? 'valid until' : 'expired at'} ${expires.toISOString()}`;
+  } catch {
+    return 'present (unparseable)';
+  }
+}
+
+async function cmdAuth(config, argv) {
+  const sub = argv[0] || 'status';
+  const target = credentialsPath(config);
+
+  if (sub === 'status') {
+    const container = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : null;
+    console.log(`${bold('container credentials')} ${target}`);
+    console.log(`  ${container ? green(describeCredentials(container)) : yellow('not present — run doclaude and use /login')}`);
+    const host = readHostCredentials(config);
+    console.log(
+      `${bold('host credentials')} ${process.platform === 'darwin' ? 'macOS Keychain' : path.join(config.hostClaudeDir, '.credentials.json')}`,
+    );
+    console.log(`  ${host ? green(describeCredentials(host)) : yellow('not present')}`);
+    return 0;
+  }
+
+  if (sub === 'import') {
+    const force = argv.includes('--force');
+    if (fs.existsSync(target) && !force) {
+      console.error(yellow(`${target} already exists; pass --force to overwrite.`));
+      return 1;
+    }
+    const raw = readHostCredentials(config);
+    if (!raw) {
+      console.error(red('no Claude Code credentials found on the host to import.'));
+      return 1;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, raw.endsWith('\n') ? raw : raw + '\n', { mode: 0o600 });
+    console.log(green(`imported host credentials into ${target}`));
+    console.log(dim(describeCredentials(raw)));
+    return 0;
+  }
+
+  if (sub === 'export') {
+    if (!fs.existsSync(target)) {
+      console.error(red(`no container credentials at ${target}`));
+      return 1;
+    }
+    const raw = fs.readFileSync(target, 'utf8').trim();
+    if (process.platform !== 'darwin') {
+      const dest = path.join(config.hostClaudeDir, '.credentials.json');
+      fs.writeFileSync(dest, raw + '\n', { mode: 0o600 });
+      console.log(green(`wrote ${dest}`));
+      return 0;
+    }
+    const result = spawnSync(
+      'security',
+      ['add-generic-password', '-U', '-a', config.hostUser, '-s', KEYCHAIN_SERVICE, '-w', raw],
+      { stdio: 'inherit' },
+    );
+    if (result.status !== 0) return result.status || 1;
+    console.log(green('wrote credentials into the macOS Keychain'));
+    return 0;
+  }
+
+  if (sub === 'reset') {
+    try {
+      fs.unlinkSync(target);
+      console.log(green(`removed ${target}`));
+    } catch {
+      console.log(dim('nothing to remove'));
+    }
+    return 0;
+  }
+
+  console.error(`unknown: doclaude self auth ${sub}`);
+  return 2;
+}
+
+async function cmdAgent(config, argv) {
+  const sub = argv[0] || 'status';
+  if (sub === 'start') {
+    const status = await startAgent(config);
+    console.log(green(`agent running on ${status.host}:${status.port} (pid ${status.pid})`));
+    return 0;
+  }
+  if (sub === 'stop') {
+    console.log((await stopAgent()) ? green('agent stopped') : dim('agent was not running'));
+    return 0;
+  }
+  if (sub === 'restart') {
+    await stopAgent();
+    await new Promise((r) => setTimeout(r, 300));
+    const status = await startAgent(config);
+    console.log(green(`agent restarted on ${status.host}:${status.port}`));
+    return 0;
+  }
+  if (sub === 'status') {
+    const status = await agentStatus();
+    if (!status.running) {
+      console.log(yellow(status.stale ? 'agent not running (stale run file)' : 'agent not running'));
+      return 1;
+    }
+    console.log(green(`agent running on ${status.host}:${status.port} (pid ${status.pid})`));
+    return 0;
+  }
+  if (sub === 'log' || sub === 'logs') {
+    if (!fs.existsSync(LOG_FILE)) {
+      console.log(dim('no log yet'));
+      return 0;
+    }
+    const follow = argv.includes('-f') || argv.includes('--follow');
+    const tailArgs = follow ? ['-n', '200', '-f', LOG_FILE] : ['-n', '200', LOG_FILE];
+    return spawnSync('tail', tailArgs, { stdio: 'inherit' }).status || 0;
+  }
+  console.error(`unknown: doclaude self agent ${sub}`);
+  return 2;
+}
+
+function cmdRebuild(config, argv) {
+  const docker = dockerCmd(config);
+  ensureDockerRunning(docker);
+  if (!config.repoDir || !fs.existsSync(path.join(config.repoDir, 'Dockerfile'))) {
+    die(`cannot find the cc-docker checkout at ${config.repoDir}`, 'Re-run ./install.sh from the repository.');
+  }
+  const args = ['build', '-t', config.image];
+  if (argv.includes('--no-cache')) args.push('--no-cache');
+  if (config.claudeVersion) args.push('--build-arg', `CLAUDE_VERSION=${config.claudeVersion}`);
+  if (config.extraAptPackages) args.push('--build-arg', `EXTRA_APT_PACKAGES=${config.extraAptPackages}`);
+  args.push(config.repoDir);
+  console.log(dim(`${docker} ${args.join(' ')}`));
+  const result = spawnSync(docker, args, { stdio: 'inherit' });
+  return result.status || 0;
+}
+
+async function cmdDoctor(config) {
+  let problems = 0;
+  const ok = (label, detail) => console.log(`${green('  ok')}  ${label}${detail ? dim(' — ' + detail) : ''}`);
+  const bad = (label, detail) => {
+    problems += 1;
+    console.log(`${red(' fail')}  ${label}${detail ? dim(' — ' + detail) : ''}`);
+  };
+  const warn = (label, detail) => console.log(`${yellow(' warn')}  ${label}${detail ? dim(' — ' + detail) : ''}`);
+
+  console.log(bold('cc-docker doctor'));
+  console.log(dim(`  config      ${CONFIG_FILE}`));
+  console.log(dim(`  checkout    ${config.repoDir}`));
+  console.log(dim(`  image       ${config.image}`));
+  console.log(dim(`  claude cfg  ${config.claudeConfigDir}`));
+  console.log('');
+
+  const docker = dockerCmd(config);
+  try {
+    const version = ensureDockerRunning(docker);
+    ok(`${docker} daemon`, `server ${version}`);
+  } catch {
+    bad(`${docker} daemon`);
+  }
+
+  if (imageExists(docker, config.image)) ok('image built');
+  else bad('image built', `run: doclaude self rebuild`);
+
+  const agent = await agentStatus();
+  if (agent.running) ok('host agent', `${agent.host}:${agent.port} pid ${agent.pid}`);
+  else warn('host agent', 'not running (it starts automatically with doclaude)');
+
+  if (fs.existsSync(TOKEN_FILE)) ok('agent token');
+  else bad('agent token', `missing ${TOKEN_FILE}`);
+
+  if (fs.existsSync(config.hostClaudeDir)) ok('host ~/.claude', config.hostClaudeDir);
+  else warn('host ~/.claude', 'not found; skills and plugins will be empty');
+
+  const hostConfig = readJson(config.hostClaudeJson, {}) || {};
+  const servers = Object.keys(hostConfig.mcpServers || {});
+  if (servers.length) ok('host MCP servers', servers.join(', '));
+  else warn('host MCP servers', 'none configured');
+
+  if (fs.existsSync(credentialsPath(config))) {
+    ok('container login', describeCredentials(fs.readFileSync(credentialsPath(config), 'utf8')));
+  } else {
+    warn('container login', 'not logged in yet — run doclaude and use /login');
+  }
+
+  const bindHost = resolveBindHost(config, docker);
+  if (process.platform === 'linux' && bindHost === '127.0.0.1') {
+    bad('agent bind address', 'on Linux the container cannot reach a loopback-only agent');
+  } else {
+    ok('agent bind address', bindHost);
+  }
+
+  // The one check that cannot be reasoned about: whether a real container on
+  // this particular runtime can actually open a socket back to the agent.
+  if (imageExists(docker, config.image)) {
+    const live = agent.running ? agent : await startAgent(config);
+    const probe = spawnSync(
+      docker,
+      [
+        'run', '--rm',
+        '--add-host', 'host.docker.internal:host-gateway',
+        '-e', `DOCLAUDE_AGENT_PORT=${live.port}`,
+        '-e', 'DOCLAUDE_TOKEN_FILE=/tmp/doclaude-token',
+        '-v', `${TOKEN_FILE}:/tmp/doclaude-token:ro`,
+        '--entrypoint', 'node',
+        config.image,
+        '/opt/doclaude/bin/ccd-probe.mjs',
+      ],
+      { encoding: 'utf8', timeout: 60000 },
+    );
+    let report = null;
+    try {
+      report = JSON.parse((probe.stdout || '').trim().split('\n').pop());
+    } catch {
+      /* runtime failed before the probe spoke */
+    }
+    if (report && report.ok) {
+      ok('container → host agent', `reachable via ${report.via}`);
+    } else if (report) {
+      bad('container → host agent', report.error || 'handshake refused');
+    } else {
+      bad('container → host agent', (probe.stderr || 'could not run the probe container').trim().split('\n')[0]);
+    }
+  }
+
+  console.log('');
+  console.log(problems ? red(`${problems} problem(s) found`) : green('all good'));
+  return problems ? 1 : 0;
+}
+
+function cmdConfig(config, argv) {
+  const sub = argv[0] || 'show';
+  if (sub === 'path') {
+    console.log(CONFIG_FILE);
+    return 0;
+  }
+  if (sub === 'edit') {
+    const editor = process.env.VISUAL || process.env.EDITOR || 'vi';
+    return spawnSync(editor, [CONFIG_FILE], { stdio: 'inherit' }).status || 0;
+  }
+  console.log(JSON.stringify(config, null, 2));
+  return 0;
+}
+
+function cmdUpdate(config, argv) {
+  if (fs.existsSync(path.join(config.repoDir, '.git'))) {
+    console.log(dim(`git -C ${config.repoDir} pull --ff-only`));
+    const pull = spawnSync('git', ['-C', config.repoDir, 'pull', '--ff-only'], { stdio: 'inherit' });
+    if (pull.status !== 0) {
+      console.error(yellow('git pull failed; rebuilding from the current checkout anyway'));
+    }
+  }
+  const install = path.join(config.repoDir, 'install.sh');
+  if (fs.existsSync(install)) {
+    return spawnSync('bash', [install, '--reinstall'], { stdio: 'inherit' }).status || 0;
+  }
+  return cmdRebuild(config, argv);
+}
+
+function usage() {
+  console.log(`${bold('doclaude')} — Claude Code in a container, wired to this machine
+
+  doclaude [claude args...]        run Claude Code in the container
+  doclaude self shell [cmd...]     open a shell in the container instead
+  doclaude self agent <start|stop|restart|status|log>
+  doclaude self auth <status|import|export|reset>
+  doclaude self rebuild [--no-cache]
+  doclaude self update             git pull + reinstall
+  doclaude self doctor             check the whole setup
+  doclaude self config [show|edit|path]
+  doclaude self version
+
+Anything not under ${bold('self')} is passed straight to Claude Code, so
+${dim('doclaude -p "hi"')}, ${dim('doclaude mcp list')} and ${dim('doclaude --resume')} all work.`);
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+async function runContainer(config, argv, { shell = false } = {}) {
+  const docker = dockerCmd(config);
+  ensureDockerRunning(docker);
+
+  if (!imageExists(docker, config.image)) {
+    die(`image ${config.image} is not built`, 'Run: doclaude self rebuild');
+  }
+
+  const workdir = process.cwd();
+  const agent = await startAgent(config);
+  const session = crypto.randomBytes(6).toString('hex');
+
+  const args = dockerRunArgs(config, { session, agent, workdir, shell });
+  args.push(...argv);
+
+  if (process.env.DOCLAUDE_DEBUG === '1') {
+    console.error(dim(`${docker} ${args.join(' ')}`));
+  }
+
+  const child = spawn(docker, args, { stdio: 'inherit' });
+  // Let the container own the terminal; forward the signals it cannot see.
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => {
+      spawnSync(docker, ['kill', '--signal', signal, `doclaude-${session}`], { stdio: 'ignore' });
+    });
+  }
+  child.on('exit', (code, signal) => {
+    process.exit(signal ? 1 : code == null ? 0 : code);
+  });
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+
+  if (argv[0] === 'self') {
+    const config = loadConfig();
+    const sub = argv[1];
+    const rest = argv.slice(2);
+    switch (sub) {
+      case 'shell':
+        return runContainer(config, rest, { shell: true });
+      case 'agent':
+        return process.exit(await cmdAgent(config, rest));
+      case 'auth':
+        return process.exit(await cmdAuth(config, rest));
+      case 'rebuild':
+        return process.exit(cmdRebuild(config, rest));
+      case 'update':
+        return process.exit(cmdUpdate(config, rest));
+      case 'doctor':
+        return process.exit(await cmdDoctor(config));
+      case 'config':
+        return process.exit(cmdConfig(config, rest));
+      case 'version':
+        console.log(config.version || 'unknown');
+        return process.exit(0);
+      default:
+        usage();
+        return process.exit(sub ? 2 : 0);
+    }
+  }
+
+  if (argv[0] === '--help-doclaude' || argv[0] === 'self-help') {
+    usage();
+    return process.exit(0);
+  }
+
+  return runContainer(loadConfig(), argv);
+}
+
+main().catch((err) => die(err.stack || String(err)));

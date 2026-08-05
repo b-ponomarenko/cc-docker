@@ -1,0 +1,7 @@
+#!/bin/sh
+# Generic PATH shim: makes a host-only command look locally installed.
+#
+# Symlinked into /usr/local/bin under the name of each host command listed in
+# hostCommands, so `open`, `pbcopy`, `osascript`, ... transparently execute on
+# the host with the container's working directory.
+exec ccd-host "$(basename "$0")" "$@"

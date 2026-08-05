@@ -1,0 +1,10 @@
+# The protocol module is COPYed from shared/ explicitly; the repo-local symlink
+# exists only so the container scripts resolve when run outside the image.
+container/shared
+
+.git
+.github
+docs
+test
+node_modules
+*.log
