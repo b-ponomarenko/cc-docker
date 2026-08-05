@@ -82,8 +82,16 @@ function dial(host, port, timeoutMs) {
   });
 }
 
-/** Opens a connection and completes the handshake. Resolves with the socket. */
-export async function connect(hello, { timeoutMs = 15000 } = {}) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Opens a connection and completes the handshake.
+ *
+ * Retries deliberately: a container's route to the host runs through a
+ * userspace proxy in every desktop runtime, and an occasional dropped SYN-ACK
+ * is normal there. One lost packet must not be the reason a login fails.
+ */
+export async function connect(hello, { timeoutMs = 15000, passes = 3 } = {}) {
   const port = agentPort();
 
   // A previously successful host short-circuits the probe, which matters: every
@@ -95,31 +103,38 @@ export async function connect(hello, { timeoutMs = 15000 } = {}) {
     /* no cache yet */
   }
 
-  const candidates = cached
-    ? [cached, ...agentHostCandidates().filter((h) => h !== cached)]
-    : agentHostCandidates();
+  const all = agentHostCandidates();
+  let candidates = cached ? [cached, ...all.filter((h) => h !== cached)] : all;
 
   let socket = null;
-  const failures = [];
-  for (const host of candidates) {
-    try {
-      socket = await dial(host, port, Math.min(timeoutMs, 4000));
-      if (host !== cached) {
-        try {
-          fs.writeFileSync(CACHE_FILE, host);
-        } catch {
-          /* best effort */
+  const failures = new Map();
+
+  for (let pass = 0; pass < passes && !socket; pass += 1) {
+    const stillWorthTrying = [];
+    for (const host of candidates) {
+      try {
+        socket = await dial(host, port, pass === 0 ? 2000 : Math.min(timeoutMs, 5000));
+        if (host !== cached) {
+          try {
+            fs.writeFileSync(CACHE_FILE, host);
+          } catch {
+            /* best effort */
+          }
         }
+        break;
+      } catch (err) {
+        failures.set(host, err.message);
+        // A name that does not resolve will not start resolving on a retry.
+        if (!/ENOTFOUND|EAI_AGAIN/.test(err.message)) stillWorthTrying.push(host);
       }
-      break;
-    } catch (err) {
-      failures.push(err.message);
     }
+    candidates = stillWorthTrying;
+    if (!socket && candidates.length && pass < passes - 1) await sleep(300 * (pass + 1));
   }
+
   if (!socket) {
-    throw new Error(
-      `cannot reach the cc-docker host agent on port ${port}. Tried:\n  ${failures.join('\n  ')}`,
-    );
+    const detail = [...failures.entries()].map(([host, msg]) => `${host}: ${msg}`).join('\n  ');
+    throw new Error(`cannot reach the cc-docker host agent on port ${port}. Tried:\n  ${detail}`);
   }
 
   socket.write(JSON.stringify({ token: agentToken(), ...hello }) + '\n');

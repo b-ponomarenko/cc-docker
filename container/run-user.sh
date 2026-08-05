@@ -24,9 +24,13 @@ if [ -n "${DOCLAUDE_AGENT_PORT:-}" ]; then
   done
 fi
 
+# Deliberately *not* login shells: the mounted host home carries the user's own
+# dotfiles, which describe the host OS and would put host binaries back on PATH.
+# bashenv.sh gives these shells the container's environment instead.
 if [ "${DOCLAUDE_SHELL:-0}" = "1" ]; then
-  if [ "$#" -gt 0 ]; then exec /bin/bash -lc "$*"; fi
-  exec /bin/bash -l
+  if [ "$#" -gt 0 ]; then exec /bin/bash -c "$*"; fi
+  exec /bin/bash
 fi
 
-exec claude "$@"
+# Absolute path, so no PATH surprise can pick a different (or host) binary.
+exec /usr/local/bin/claude "$@"

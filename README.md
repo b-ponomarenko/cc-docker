@@ -135,6 +135,21 @@ bash's `command_not_found_handle`), but only if it is allow-listed:
 hand the container a way out of its own sandbox. Adding them is a deliberate
 edit.
 
+### PATH inside the container
+
+Because your home directory is mounted at the same absolute path, host binary
+directories (`~/.local/bin`, `~/.cargo/bin`, nvm shims) are *visible* inside the
+container — full of executables built for the host OS. Left alone they shadow
+the container's own tools, and `claude` itself resolves to a macOS binary that
+cannot run on Linux.
+
+So container directories always win, and host-home directories are dropped from
+`PATH`. Those tools are still reachable — through the host bridge, where they
+can actually execute. Set `DOCLAUDE_KEEP_HOME_PATH=1` to opt out.
+
+For the same reason shells in the container are **not** login shells: your
+`.zshrc`/`.bash_profile` describe the host, not this Linux userland.
+
 ---
 
 ## Configuration
@@ -242,6 +257,26 @@ be clear about what that means:
 * Docker, Podman, OrbStack or colima — anything providing a `docker`-compatible CLI
 * Node.js 18+ **on the host** (runs the agent; the container brings its own)
 * macOS or Linux host
+
+The container finds the host agent by trying `host.docker.internal`,
+`gateway.docker.internal`, `host.containers.internal` and finally the default
+gateway, caching whichever answers — so no single runtime is assumed.
+`doclaude self doctor` proves the route by opening a real socket from a real
+container rather than inferring it.
+
+### Verified
+
+Exercised end to end on macOS 15 (Apple Silicon) with OrbStack 29.4:
+
+* `/login` — Claude Code bound its OAuth listener on container port `36153`, the
+  shim caught the browser open, the agent bound `127.0.0.1:36153` on the host,
+  tunnelled it inward and released it when the session ended
+* a native macOS Mach-O MCP server and a `uvx` server both reporting
+  `✔ Connected` from inside the Linux container
+* `osascript` executed on the host from the container
+* Claude Code reading mounted host files and answering prompts
+
+Not yet exercised: a Linux host, and Podman/colima specifically.
 
 ## Development
 

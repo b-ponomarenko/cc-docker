@@ -595,26 +595,55 @@ async function handleConnection(socket) {
 // ---------------------------------------------------------------------------
 
 const bindHost = process.env.DOCLAUDE_AGENT_BIND || config.agentBind || '127.0.0.1';
-const wantPort = Number(process.env.DOCLAUDE_AGENT_PORT || config.agentPort || 0);
+let wantPort = Number(process.env.DOCLAUDE_AGENT_PORT || config.agentPort || 0);
+
+/**
+ * Remember the port across restarts. Container runtimes proxy host-loopback
+ * services in userspace, and a port that moves on every restart leaves that
+ * proxy — and any firewall rule the user wrote — pointing at nothing.
+ */
+function persistPort(port) {
+  try {
+    const current = readJson(CONFIG_FILE, {}) || {};
+    if (current.agentPort === port) return;
+    current.agentPort = port;
+    const tmp = `${CONFIG_FILE}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(current, null, 2) + '\n');
+    fs.renameSync(tmp, CONFIG_FILE);
+  } catch (err) {
+    log('could not persist agent port:', err.message);
+  }
+}
 
 const server = net.createServer(handleConnection);
 server.on('error', (err) => {
+  // The remembered port may have been taken by something else in the meantime;
+  // fall back to a fresh one rather than refusing to start.
+  if (err.code === 'EADDRINUSE' && wantPort) {
+    log(`port ${wantPort} is in use, choosing another`);
+    wantPort = 0;
+    server.listen(0, bindHost);
+    return;
+  }
   log('server error:', err.message);
   console.error(`cc-docker agent: ${err.message}`);
   process.exit(1);
 });
 
-server.listen(wantPort, bindHost, () => {
+server.on('listening', () => {
   const { port } = server.address();
   fs.writeFileSync(
     RUN_FILE,
     JSON.stringify({ pid: process.pid, host: bindHost, port, startedAt: Date.now() }, null, 2),
   );
+  persistPort(port);
   log(`agent listening on ${bindHost}:${port} (pid ${process.pid}, node ${process.version})`);
   if (process.env.DOCLAUDE_AGENT_FOREGROUND === '1') {
     console.log(`cc-docker agent listening on ${bindHost}:${port}`);
   }
 });
+
+server.listen(wantPort, bindHost);
 
 function shutdown(signal) {
   log(`received ${signal}, shutting down`);

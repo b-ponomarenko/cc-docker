@@ -72,6 +72,7 @@ RUN set -eux; \
     ln -sf /opt/doclaude/bin/ccd-open.mjs /usr/local/bin/sensible-browser; \
     ln -sf /opt/doclaude/bin/ccd-open.mjs /usr/local/bin/www-browser; \
     ln -sf /opt/doclaude/bashenv.sh       /etc/profile.d/doclaude.sh; \
+    printf '\n# cc-docker\n. /opt/doclaude/bashenv.sh\n' >> /etc/bash.bashrc; \
     node --input-type=module -e 'import("/opt/doclaude/lib/client.mjs")' >/dev/null
 
 # `docker inspect` friendliness / marker used by `doclaude self doctor`.

@@ -28,7 +28,10 @@ fi
 user_name="$(getent passwd "$HOST_UID" | cut -d: -f1 || true)"
 if [ -z "$user_name" ]; then
   user_name="$DOCLAUDE_USER"
-  useradd -u "$HOST_UID" -g "$HOST_GID" -d "$HOME" -s /bin/bash -M "$user_name"
+  # macOS accounts start at uid 501, which useradd warns about on every run.
+  # The warning is cosmetic; real failures still surface.
+  useradd -u "$HOST_UID" -g "$HOST_GID" -d "$HOME" -s /bin/bash -M "$user_name" \
+    2> >(grep -v 'outside of the UID_MIN' >&2)
 else
   # Reuse the pre-existing account (the node image already owns uid 1000) but
   # point it at the mounted home directory.
@@ -88,5 +91,9 @@ export BROWSER=/usr/local/bin/ccd-open
 # tool runs non-interactive shells, which read neither /etc/profile nor ~/.bashrc.
 export BASH_ENV=/opt/doclaude/bashenv.sh
 export DOCLAUDE_HOST_FALLBACK="${DOCLAUDE_HOST_FALLBACK:-1}"
+
+# Claude Code snapshots the user's shell to reproduce their environment. Point
+# it at the container's bash rather than whatever $SHELL the host reported.
+export SHELL=/bin/bash
 
 exec gosu "$user_name" /opt/doclaude/run-user.sh "$@"

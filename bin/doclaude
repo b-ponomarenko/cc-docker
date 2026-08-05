@@ -335,6 +335,11 @@ function buildEnv(config, { session, agent, workdir }) {
     env.DOCLAUDE_FORWARD_PORTS = config.forwardPorts.join(',');
   }
 
+  // Setup notes are useful when you are watching a session start, and pure
+  // noise when the output is being piped or read by a script.
+  const scripted = !process.stdout.isTTY || process.argv.includes('-p') || process.argv.includes('--print');
+  if (scripted && process.env.DOCLAUDE_VERBOSE !== '1') env.DOCLAUDE_QUIET = '1';
+
   // Pass through terminal/locale so the TUI renders the same as on the host.
   for (const key of ['TERM', 'COLORTERM', 'LANG', 'LC_ALL', 'TERM_PROGRAM']) {
     if (process.env[key]) env[key] = process.env[key];
