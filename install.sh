@@ -227,6 +227,13 @@ fi
 
 step "Installing the doclaude command"
 
+# Reuse wherever this machine put doclaude last time, otherwise an update would
+# install a second copy in the default location and leave a stale one on PATH.
+if [ -z "$BIN_DIR" ]; then
+  BIN_DIR="$(node -e 'try{process.stdout.write(require(process.argv[1]).binDir||"")}catch{}' "$CCD_DIR/config.json" 2>/dev/null || true)"
+  [ -n "$BIN_DIR" ] && ok "reusing the previous install location $BIN_DIR"
+fi
+
 if [ -z "$BIN_DIR" ]; then
   if [ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
     BIN_DIR="$HOME/.local/bin"
@@ -239,7 +246,35 @@ if [ -z "$BIN_DIR" ]; then
 fi
 mkdir -p "$BIN_DIR"
 install -m 0755 "$REPO_DIR/bin/doclaude" "$BIN_DIR/doclaude"
+node -e '
+  const fs = require("fs");
+  const [file, dir] = process.argv.slice(1);
+  const config = JSON.parse(fs.readFileSync(file, "utf8"));
+  config.binDir = dir;
+  fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n");
+' "$CCD_DIR/config.json" "$BIN_DIR"
 ok "installed $BIN_DIR/doclaude"
+
+# ---------------------------------------------------------------------------
+# refresh the host agent
+#
+# The agent was just replaced on disk, but a process started before this run is
+# still executing the old code — so an agent fix would not take effect until the
+# next reboot. Stop it; the launcher starts a fresh one on demand.
+# ---------------------------------------------------------------------------
+
+AGENT_RUN="$CCD_DIR/run/agent.json"
+if [ -f "$AGENT_RUN" ]; then
+  AGENT_PID="$(node -e 'try{process.stdout.write(String(require(process.argv[1]).pid))}catch{}' "$AGENT_RUN" 2>/dev/null || true)"
+  LIVE_SESSIONS="$("$DOCKER_BIN" ps -q --filter 'name=doclaude-' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${LIVE_SESSIONS:-0}" -gt 0 ]; then
+    warn "a doclaude session is running — left the old agent alone so it keeps working"
+    warn "when you are done: doclaude self agent restart"
+  elif [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null; then
+    rm -f "$AGENT_RUN"
+    ok "stopped the previous host agent (a new one starts on the next run)"
+  fi
+fi
 
 ON_PATH=0
 case ":$PATH:" in *":$BIN_DIR:"*) ON_PATH=1 ;; esac

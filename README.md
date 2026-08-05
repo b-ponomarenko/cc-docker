@@ -248,6 +248,31 @@ working, without exposing the rest of your home directory.
 
 ---
 
+## Updating a machine that already has doclaude
+
+```bash
+doclaude self update
+```
+
+That pulls the checkout, re-runs the installer and rebuilds the image. It keeps
+everything machine-specific: your login, `~/.cc-docker/claude/settings.json`,
+your `config.json` edits, the trusted root certificates and the directory
+`doclaude` was installed into. Hand edits to `config.json` are merged, not
+overwritten — only new defaults move.
+
+Two things it deliberately does *not* leave stale:
+
+* The **host agent** is a long-lived process. Replacing `agent.mjs` on disk does
+  not change the code already running, so the installer stops it and the next
+  `doclaude` starts a fresh one. If a session is open at the time it says so and
+  leaves it running — finish the session, then `doclaude self agent restart`.
+* The **`doclaude` command** is reinstalled to the same directory as before,
+  rather than the default one, so a `--bin-dir` install never ends up with two
+  copies on `PATH`.
+
+If the checkout is gone, clone it again and run `./install.sh` there; it picks up
+this machine's existing configuration and login rather than starting over.
+
 ## Command reference
 
 ```

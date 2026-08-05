@@ -732,6 +732,17 @@ function cmdConfig(config, argv) {
 }
 
 function cmdUpdate(config, argv) {
+  // The agent and the image are self-contained under ~/.cc-docker, so doclaude
+  // keeps working without the checkout — but updating needs the sources back.
+  if (!fs.existsSync(path.join(config.repoDir, 'install.sh'))) {
+    die(
+      `the cc-docker checkout is gone from ${config.repoDir}`,
+      'Clone it again and run ./install.sh there — it will reuse this machine\'s\n' +
+        'existing configuration, login and install location:\n\n' +
+        '  git clone git@github.com:b-ponomarenko/cc-docker.git\n' +
+        '  cd cc-docker && ./install.sh\n',
+    );
+  }
   if (fs.existsSync(path.join(config.repoDir, '.git'))) {
     console.log(dim(`git -C ${config.repoDir} pull --ff-only`));
     const pull = spawnSync('git', ['-C', config.repoDir, 'pull', '--ff-only'], { stdio: 'inherit' });
